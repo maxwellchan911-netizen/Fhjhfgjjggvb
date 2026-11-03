@@ -1,0 +1,1372 @@
+local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/main/Library.lua"))()
+local Toggles = Library.Toggles
+local Options = Library.Options
+
+local Window = Library:CreateWindow({
+    Title = "DeepSeek.Lua",
+    Footer = "version: 4.5 | by deepseek",
+    Center = true, AutoShow = true, Resizable = true, MobileButtonsSide = "Left"
+})
+
+local function Notify(t, d)
+    Library:Notify({ Title = "DeepSeek.Lua", Description = t, Time = d or 3 })
+end
+
+local Players     = game:GetService("Players")
+local RunService  = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+local rng         = Random.new()
+local char, root, hum
+local conns = {}
+
+local function kill(key)
+    if conns[key] then conns[key]:Disconnect(); conns[key] = nil end
+end
+
+local function closest()
+    if not root then return end
+    local best, bd = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local h = p.Character:FindFirstChild("HumanoidRootPart")
+            if h then
+                local d = (root.Position - h.Position).Magnitude
+                if d < bd then bd = d; best = p end
+            end
+        end
+    end
+    return best
+end
+
+local CFG = {
+    enabled = false, method = "Quantum",
+    speed = 1e9, chaos = 0.98, alt = 1e10, radius = 2e11,
+    evade = true, smart = true, curve = true, anticipate = true,
+    evRadius = 8e9, evSpeed = 6e9, evVert = 3e9, evCD = 0.015,
+    evTrigger = 1.0, evStrength = 1.0,
+    evDecay = 5, evMax = 0.5, lead = 0.2,
+    ev3D = true, evBoundary = true,
+    dwell = true, dMin = 2, dMax = 8, dJitter = 0.02, dwellCap = 0.35,
+    skip = 0.08, skew = 1.5, velFollow = 0.4,
+    adSnap = true, snapRetarget = true, stuckThreshold = 0.6, predPressure = true,
+    mtp = true, mtpCount = 8, mtpSpread = 5e10, mtpRate = 1, mtpStruct = false, mtpFib = true,
+    pulse = true, pulseForce = 8e7, altChaos = true, altRange = 5e10,
+    phase = true, phaseInt = 0.06, phaseAdaptive = true,
+    phaseMethods = { "Quantum", "HyperChaos", "Scatter", "Rift", "Storm", "Nova" },
+    phaseLow  = { "Quantum", "Drift", "Loop" },
+    phaseMid  = { "Quantum", "Scatter", "Storm" },
+    phaseHigh = { "HyperChaos", "Rift", "Nova" },
+    ghost = true, ghostCount = 3, ghostSpread = 2e10, ghostRate = 1,
+    ghostTrail = true, ghostRing = true, ghostDynamic = true,
+    velSpoof = true, velForce = 5e8, chaffMode = "random",
+    motionBoost = true, subTick = true, randOrient = true, snapCheck = true,
+    novaRadius = 3e11, novaPhases = 6, novaPulse = true, novaPeriod = 0.8,
+    qLookAhead = 3, qSamples = 24, horizonWeight = 0.4, qPosThresh = 0.15,
+    -- Mirror
+    mirror = false, mirrorAxis = "X", mirrorMode = "Alternate",
+    mirrorRate = 0.08, mirrorDual = true,
+}
+
+local elapsed, phaseT, phaseIdx = 0, 0, 1
+local voidPos = Vector3.new(0, CFG.alt, 0)
+local driftDir = Vector3.new(1, 0, 0)
+local basePos  = Vector3.new(0, CFG.alt, 0)
+local evCD, target = 0, Vector3.new(0, CFG.alt, 0)
+local evOffset = Vector3.new()
+local lastSet, heartFrame, snapBoost = nil, 0, 0
+local frameOK = true
+local avgDt = 1/60
+
+local dwellAnchor, dwellLeft, dwellSpread, dwellSeed, dwellStart = nil, 0, 0, 0, 0
+local qState, qHold, qAge, qSpread = nil, 1, 0, 0
+local qPressure, qPressureAtPick, qPressurePrev = 0, 0, 0
+local qThreatSnap = nil
+local motionHist, motionN, motionVar = {}, 0, 1
+local lastMoveT = 0
+local novaPhase, novaT = 0, 0
+local novaDir, novaDirFrom = Vector3.new(0, 0, 1), Vector3.new(0, 0, 1)
+local novaSmoothT = 0
+local visitedPos = {}
+
+-- mirror state
+local mirrorOn, mirrorTimer = false, 0
+
+local xorState = os.clock() * 1e9 + 12345
+local function xorShift()
+    xorState = bit32.bxor(xorState, bit32.lshift(xorState, 13))
+    xorState = bit32.bxor(xorState, bit32.rshift(xorState, 7))
+    xorState = bit32.bxor(xorState, bit32.lshift(xorState, 17))
+    xorState = xorState % 2147483647
+    return xorState / 2147483647
+end
+
+local TELEPORT_METHODS = { Quantum = true, HyperChaos = true, Scatter = true, Rift = true }
+
+local function rSign() return rng:NextInteger(0, 1) * 2 - 1 end
+local function rVec(r)
+    return Vector3.new((rng:NextNumber() - 0.5) * 2 * r, (rng:NextNumber() - 0.5) * 2 * r, (rng:NextNumber() - 0.5) * 2 * r)
+end
+local function xVec(r)
+    return Vector3.new((xorShift() - 0.5) * 2 * r, (xorShift() - 0.5) * 2 * r, (xorShift() - 0.5) * 2 * r)
+end
+local function triR() return rng:NextNumber() + rng:NextNumber() - 1 end
+
+-- Hoisted CFrame/velocity setters (avoid per-call closures in hot loops)
+local function _setCF(hrp, cf) hrp.CFrame = cf end
+local function _setVel(hrp, v) hrp.AssemblyLinearVelocity = v end
+local function _setAng(hrp, v) hrp.AssemblyAngularVelocity = v end
+
+local PHI = (1 + math.sqrt(5)) / 2
+local function fibSpherePoint(i, n, r)
+    local theta = 2 * math.pi * i / PHI
+    local phi = math.acos(math.clamp(1 - 2 * (i + 0.5) / n, -1, 1))
+    return Vector3.new(
+        r * math.sin(phi) * math.cos(theta),
+        r * math.cos(phi),
+        r * math.sin(phi) * math.sin(theta)
+    )
+end
+
+local function makeCF(pos, dir)
+    local c = CFrame.new(pos)
+    if CFG.velFollow > 0 and dir and dir.Magnitude > 0.01 then
+        c = CFrame.lookAt(pos, pos + dir.Unit)
+        local j = CFG.velFollow * 0.4
+        c = c * CFrame.Angles((rng:NextNumber()-0.5)*j, (rng:NextNumber()-0.5)*j, (rng:NextNumber()-0.5)*j)
+    end
+    if CFG.randOrient then
+        c = c * CFrame.Angles(rng:NextNumber()*math.pi*2, rng:NextNumber()*math.pi*2, rng:NextNumber()*math.pi*2)
+    end
+    return c
+end
+
+local function driftDir3D(t)
+    local nx, ny, nz = 0, 0, 0
+    local amp, f = 1, 0.00007
+    for i = 1, 6 do
+        nx = nx + math.noise(t*f, 13.7*i, 0) * amp
+        ny = ny + math.noise(0, t*f, 31.1*i) * amp
+        nz = nz + math.noise(7.3*i, 0, t*f) * amp
+        f = f * 2.37; amp = amp * 0.48
+    end
+    local sp = t * 0.00073
+    nx = nx + math.sin(sp*1.618)*0.35
+    ny = ny + math.cos(sp*2.718)*0.35
+    nz = nz + math.sin(sp*1.300)*0.35
+    local len = math.sqrt(nx*nx + ny*ny + nz*nz)
+    if len < 0.001 then return 1, 0, 0 end
+    return nx/len, ny/len, nz/len
+end
+
+local function altJ(b)
+    if not CFG.altChaos then return b end
+    return b + (rng:NextNumber() - 0.5) * 2 * CFG.altRange
+end
+
+local function scan()
+    local list, sum = {}, Vector3.new()
+    local nearR = CFG.evRadius * CFG.evTrigger
+    local scanR = CFG.evRadius * 3
+    local minD, closestPos, closestVel = math.huge, nil, Vector3.new()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            local h = p.Character:FindFirstChild("HumanoidRootPart")
+            local hp = p.Character:FindFirstChildOfClass("Humanoid")
+            if h and hp and hp.Health > 0 then
+                local v = h.AssemblyLinearVelocity
+                local a = h.AssemblyLinearAcceleration or Vector3.new()
+                local L = CFG.lead
+                local pred = h.Position + v*L + a*(L*L*0.5)
+                local d = (pred - target).Magnitude
+                if d < scanR then
+                    local isNear = d < nearR
+                    local velWeight = 1 + math.min(1.5, v.Magnitude/1000)
+                    list[#list+1] = { pos=pred, dist=d, vel=v, near=isNear, weight=velWeight }
+                    if isNear then
+                        sum = sum + (pred-target).Unit * velWeight / math.max(d, 1e3)
+                        if d < minD then minD=d; closestPos=pred; closestVel=v end
+                    end
+                end
+            end
+        end
+    end
+    return list, sum, minD, closestPos, closestVel
+end
+
+local function pressure(threats, minD)
+    if #threats == 0 then return 0 end
+    local closest = math.max(0, 1 - minD / (CFG.evRadius*2))
+    local predictive = 0
+    if CFG.predPressure then
+        for _, t in ipairs(threats) do
+            if not t.near and t.vel.Magnitude > 100 then
+                local rel = t.pos - target
+                local vv = t.vel:Dot(t.vel)
+                if vv > 100 then
+                    local ttc = rel:Dot(t.vel)/vv
+                    if ttc > 0 and ttc < 0.5 then
+                        local fd = (t.pos + t.vel*ttc - target).Magnitude
+                        if fd < CFG.evRadius then
+                            predictive = predictive + (1 - fd/CFG.evRadius)*0.4*t.weight
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local vw = 0
+    for _, t in ipairs(threats) do vw = vw + t.weight end
+    local countP = math.min(1, vw/5)*0.3
+    return math.min(1, closest + predictive + countP)
+end
+
+local function track(pos)
+    motionHist[motionN % 30 + 1] = pos
+    motionN = motionN + 1
+    if motionN < 15 then return end
+    local n = math.min(motionN, 30)
+    local cx, cy, cz = 0, 0, 0
+    for i = 1, n do local p = motionHist[i]; cx=cx+p.X; cy=cy+p.Y; cz=cz+p.Z end
+    local c = Vector3.new(cx/n, cy/n, cz/n)
+    local v = 0
+    for i = 1, n do v = v + (motionHist[i] - c).Magnitude end
+    motionVar = v/n
+end
+
+local function boost()
+    if not CFG.motionBoost then return 1 end
+    local t = CFG.radius * 0.35
+    if motionVar < t then return 1 + (t - motionVar)/t*2 end
+    return 1
+end
+
+local function decayEv(dt)
+    local m = evOffset.Magnitude
+    if m < 1 then evOffset = Vector3.new(); return end
+    local mx = CFG.radius * CFG.evMax
+    if m > mx then
+        if m > mx * 0.8 then
+            local angle = rng:NextNumber() * math.pi * 0.6
+            evOffset = (CFrame.Angles(0, angle * rSign(), 0) * evOffset)
+        end
+        evOffset = evOffset.Unit * mx
+        m = mx
+    end
+    evOffset = evOffset * math.max(0, 1 - CFG.evDecay*dt)
+end
+
+local function findGap3D(threats, lookahead, dist)
+    local n = #threats
+    if n == 0 then return Vector3.new(0,0,1) end
+    local samples = math.clamp(n * 8, 32, 96)
+    local boundary = CFG.radius * 0.93
+    local f1, f2 = {}, {}
+    for i = 1, n do
+        f1[i] = threats[i].pos + threats[i].vel * lookahead
+        f2[i] = threats[i].pos + threats[i].vel * (lookahead * 2.5)
+    end
+    local bestDir, bestScore = nil, -math.huge
+    for i = 0, samples - 1 do
+        local dir = fibSpherePoint(i, samples, 1)
+        local test = target + dir * dist
+        local valid = true
+        if CFG.evBoundary then
+            local off = test - basePos
+            if off.Magnitude > boundary then
+                local nn = off.Unit
+                dir = dir - nn * dir:Dot(nn) * 1.3
+                if dir.Magnitude < 0.01 then valid = false
+                else
+                    dir = dir.Unit
+                    test = target + dir * dist
+                    if (test - basePos).Magnitude > CFG.radius then valid = false end
+                end
+            end
+        end
+        if valid then
+            local minGap = math.huge
+            for j = 1, n do
+                local w = math.max(threats[j].weight, 1)
+                local d1 = (f1[j] - test).Magnitude / w
+                if d1 < minGap then minGap = d1 end
+                local d2 = (f2[j] - test).Magnitude / w
+                if d2 < minGap then minGap = d2 end
+            end
+            if minGap > bestScore then bestScore = minGap; bestDir = dir end
+        end
+    end
+    return bestDir or Vector3.new(0,0,1)
+end
+
+local function findGap2D(threats, lookahead, dist)
+    local n = #threats
+    if n == 0 then return Vector3.new(0,0,1) end
+    local f1, f2 = {}, {}
+    for i = 1, n do
+        f1[i] = threats[i].pos + threats[i].vel * lookahead
+        f2[i] = threats[i].pos + threats[i].vel * (lookahead * 2.5)
+    end
+    local samples = 24
+    local bestDir, bestScore = Vector3.new(0,0,1), -math.huge
+    for i = 0, samples - 1 do
+        local a = (i/samples) * math.pi * 2
+        local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+        local test = target + dir * dist
+        local minGap = math.huge
+        for j = 1, n do
+            local w = math.max(threats[j].weight, 1)
+            local d1 = (f1[j] - test).Magnitude / w
+            if d1 < minGap then minGap = d1 end
+            local d2 = (f2[j] - test).Magnitude / w
+            if d2 < minGap then minGap = d2 end
+        end
+        if minGap > bestScore then bestScore = minGap; bestDir = dir end
+    end
+    return bestDir
+end
+
+local function evade(threats, sum, minD, closestVel)
+    if not CFG.evade or evCD > 0 then return end
+    local immediate = minD < CFG.evRadius * CFG.evTrigger
+    local anticipate, antDir = false, Vector3.new()
+    if CFG.anticipate then
+        for _, t in ipairs(threats) do
+            if not t.near and t.vel.Magnitude > 10 then
+                local vv = t.vel:Dot(t.vel)
+                if vv > 100 then
+                    local rel = t.pos - target
+                    local ttc = rel:Dot(t.vel)/vv
+                    if ttc > 0 and ttc < 0.4 then
+                        local fut = t.pos + t.vel*ttc
+                        if (fut - target).Magnitude < CFG.evRadius * 0.5 then
+                            local perp = t.vel:Cross(Vector3.new(0,1,0))
+                            if perp.Magnitude > 0.01 then
+                                anticipate = true
+                                antDir = antDir + perp.Unit * rSign()
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if not immediate and not anticipate then return end
+    evCD = CFG.evCD
+    local hpScale = 1
+    if hum and hum.MaxHealth > 0 and hum.Health < hum.MaxHealth*0.5 then hpScale = 1.5 end
+    local amt = CFG.evSpeed * CFG.evStrength * 0.05 * hpScale
+
+    if immediate then
+        local near = {}
+        for _, t in ipairs(threats) do if t.near then near[#near+1] = t end end
+        if #near > 0 then
+            local fall = 1 + (1 - minD/(CFG.evRadius*CFG.evTrigger)) * 4
+            local away = sum.Magnitude > 0.001 and -sum.Unit or rVec(1).Unit
+            local awayH = Vector3.new(away.X, 0, away.Z)
+            if awayH.Magnitude > 0.05 then awayH = awayH.Unit else awayH = away end
+            local dir = awayH
+            if CFG.curve then
+                dir = CFG.ev3D and findGap3D(near, 0.2, CFG.evRadius*0.5)
+                               or  findGap2D(near, 0.2, CFG.evRadius*0.5)
+                if CFG.ev3D and math.abs(dir.Y) > 0.9 then
+                    dir = findGap2D(near, 0.2, CFG.evRadius*0.5)
+                end
+            elseif CFG.smart and closestVel.Magnitude > 100 then
+                local perp = closestVel:Cross(Vector3.new(0,1,0))
+                if perp.Magnitude > 0.01 then
+                    perp = perp.Unit
+                    if perp:Dot(awayH) < 0 then perp = -perp end
+                    dir = (perp*0.7 + awayH*0.3).Unit
+                end
+            end
+            dir = (dir + rVec(0.25).Unit * 0.25).Unit
+            evOffset = evOffset + dir * amt * fall
+            if minD < CFG.evRadius * 0.4 then
+                evOffset = evOffset + Vector3.new(0, CFG.evVert*fall*0.05*rSign(), 0)
+            end
+            if #near >= 3 then evOffset = evOffset * 1.15 end
+        end
+    end
+    if anticipate and antDir.Magnitude > 0.01 then
+        evOffset = evOffset + antDir.Unit * amt * 0.6
+    end
+    local mx = CFG.radius * CFG.evMax
+    if evOffset.Magnitude > mx then evOffset = evOffset.Unit * mx end
+end
+
+local function clampPos(pos)
+    local off = pos - basePos
+    local m = off.Magnitude
+    local R = CFG.radius
+    if m < R * 0.85 then return pos end
+    if m > R then
+        local overshoot = m - R
+        local inward = math.min(overshoot * 1.2, R * 0.15)
+        return pos - off.Unit * (overshoot + inward)
+    end
+    local k = (m - R*0.85) / (R*0.15)
+    return pos - off.Unit * R * k * 0.03
+end
+
+local function buildThreatSnapshot(threats)
+    local list = {}
+    for i, t in ipairs(threats) do
+        local vmag = t.vel.Magnitude
+        list[i] = {
+            pos = t.pos,
+            futurePos = t.pos + t.vel*0.15,
+            vel = t.vel,
+            velUnit = vmag > 0.01 and t.vel.Unit or Vector3.new(),
+            velMag = vmag,
+            weight = t.weight,
+            dist = t.dist,
+        }
+    end
+    local horizon = {}
+    for s = 1, CFG.qLookAhead do
+        local step = {}
+        for i, t in ipairs(threats) do
+            step[i] = { pos = t.pos + t.vel*(s*0.1), weight = t.weight }
+        end
+        horizon[s] = step
+    end
+    return { list = list, horizon = horizon }
+end
+
+local function horizonScore(pos, horizon)
+    if #horizon == 0 then return 0 end
+    local score = 0
+    for s = 1, #horizon do
+        local step = horizon[s]
+        if #step > 0 then
+            local minD = math.huge
+            for i = 1, #step do
+                local t = step[i]
+                local d = (t.pos - pos).Magnitude / t.weight
+                if d < minD then minD = d end
+            end
+            score = score + (minD / math.max(CFG.evRadius, 1)) * (1/s)
+        end
+    end
+    return score
+end
+
+local function scoreDestFast(c, snap, ev, pres)
+    local realC = c + ev
+    local s, penalty = 0, 0
+    local list = snap.list
+    for i = 1, #list do
+        local t = list[i]
+        local nowD = (t.pos - realC).Magnitude
+        local futD = (t.futurePos - realC).Magnitude
+        local worst = math.min(nowD, futD)
+        s = s + (worst / math.max(t.dist, 1e6) / t.weight) ^ 2
+        if t.velMag > 100 and futD < CFG.evRadius * 2 then
+            local toward = (realC - t.futurePos).Unit:Dot(t.velUnit)
+            if toward > 0.5 then penalty = penalty + (toward - 0.5) * 4 * t.weight end
+        end
+    end
+    if CFG.horizonWeight > 0 and #list > 0 then
+        s = s + horizonScore(realC, snap.horizon) * CFG.horizonWeight
+    end
+    local rad = (c - basePos).Magnitude / CFG.radius
+    if rad > 0.85 then s = s - (rad - 0.85) * 30 end
+    if pres < 0.4 and qState then
+        local prox = (c - qState).Magnitude / CFG.radius
+        s = s - math.abs(prox - 0.25) * 10 * (1 - pres/0.4)
+    end
+    if (c - target).Magnitude < CFG.radius * 0.15 then s = s - 2 end
+    local thresh = CFG.radius * 0.12
+    for i = 1, #visitedPos do
+        local v = visitedPos[i]
+        local d = (c - v.pos).Magnitude
+        if d < thresh then
+            local age = elapsed - v.t
+            if age < 1.5 then
+                s = s - (1 - d/thresh) * (1 - age/1.5) * 6
+            end
+        end
+    end
+    return s - penalty
+end
+
+-- IMPROVED: smart first-guess (opposite of threat centroid) + explorative random
+local function pickDestFast(snap, pres, ev)
+    local fpsScale = math.clamp((1/60)/avgDt, 0.3, 1)
+    local n = math.max(6, math.floor((CFG.qSamples + pres*30) * fpsScale))
+    local best, bestS = nil, -math.huge
+
+    -- Seed with a heuristic guess: escape opposite of threat centroid
+    if #snap.list > 0 then
+        local cx, cy, cz = 0, 0, 0
+        for i = 1, #snap.list do
+            local t = snap.list[i]
+            cx = cx + t.pos.X; cy = cy + t.pos.Y; cz = cz + t.pos.Z
+        end
+        local cnt = #snap.list
+        local away = basePos - Vector3.new(cx/cnt, cy/cnt, cz/cnt)
+        if away.Magnitude > 1 then
+            local guess = basePos + away.Unit * CFG.radius * 0.7
+            local off = guess - basePos
+            if off.Magnitude > CFG.radius * 0.9 then
+                guess = basePos + off.Unit * CFG.radius * 0.9
+            end
+            local s = scoreDestFast(guess, snap, ev, pres)
+            if s > bestS then bestS = s; best = guess end
+        end
+    end
+
+    for _ = 1, n do
+        local c = basePos + rVec(CFG.radius * 0.9)
+        local s = scoreDestFast(c, snap, ev, pres)
+        if s > bestS then bestS = s; best = c end
+    end
+    return best or (basePos + rVec(CFG.radius * 0.9))
+end
+
+local function threatMoved(threats, thresh)
+    if not qThreatSnap then return true end
+    if #threats ~= #qThreatSnap then return true end
+    for i, t in ipairs(threats) do
+        if (t.pos - qThreatSnap[i]).Magnitude > thresh then return true end
+    end
+    return false
+end
+
+local function snapshotThreats(threats)
+    qThreatSnap = {}
+    for i, t in ipairs(threats) do qThreatSnap[i] = t.pos end
+end
+
+local function quantumStep(threats, minD)
+    qAge = qAge + 1
+    local forced = minD < CFG.evRadius * 0.5
+    local diverging = CFG.motionBoost and motionN > 20 and motionVar < CFG.radius * 0.1
+    local shifted = math.abs(qPressure - qPressureAtPick) > 0.35
+                    or threatMoved(threats, CFG.radius * CFG.qPosThresh)
+    local stuck = (elapsed - lastMoveT) > CFG.stuckThreshold
+
+    if forced or diverging or shifted or stuck or qAge >= qHold or not qState then
+        local snap = buildThreatSnapshot(threats)
+        local newState = pickDestFast(snap, qPressure, evOffset)
+        local accept = (not qState) or forced or stuck
+        if not accept then
+            local newS = scoreDestFast(newState, snap, evOffset, qPressure)
+            local oldS = scoreDestFast(qState,  snap, evOffset, qPressure)
+            accept = newS > oldS * 1.08
+        end
+        if accept then
+            qAge = 0
+            qPressureAtPick = qPressure
+            local lo, hi
+            if qPressure < 0.3 then lo, hi = 8, 15
+            elseif qPressure < 0.7 then lo, hi = 3, 8
+            else lo, hi = 1, 3 end
+            if forced or diverging or stuck then qHold = 1
+            else qHold = rng:NextInteger(lo, hi) end
+            qState = newState
+            qSpread = 0
+            snapshotThreats(threats)
+        else
+            qHold = qAge + 2
+        end
+    end
+
+    local mult = 0.15 + qPressure * 0.85
+    if qPressure < 0.2 then
+        qSpread = math.max(0, qSpread - CFG.radius * 0.012 * boost())
+    else
+        qSpread = math.min(
+            qSpread + CFG.radius * 0.005 * boost() * mult,
+            CFG.radius * 0.08 * mult
+        )
+    end
+    return qState + rVec(qSpread)
+end
+
+local function novaStep(dt)
+    local period = math.max(0.2, CFG.novaPeriod) * 2
+    novaT = novaT + dt
+    if novaT >= period or novaDir.Magnitude < 0.1 then
+        novaT = novaT - period * math.floor(novaT / period)
+        novaPhase = (novaPhase + 1) % CFG.novaPhases
+        local th = rng:NextNumber() * math.pi * 2
+        local phi = math.acos(math.clamp(2*rng:NextNumber() - 1, -1, 1))
+        novaDirFrom = novaDir
+        novaDir = Vector3.new(
+            math.sin(phi)*math.cos(th), math.cos(phi), math.sin(phi)*math.sin(th)
+        )
+        novaSmoothT = 0
+    end
+    if novaSmoothT < 0.12 then
+        novaSmoothT = novaSmoothT + dt
+        local t = math.min(1, novaSmoothT / 0.12)
+        local blended = novaDirFrom:Lerp(novaDir, t)
+        if blended.Magnitude > 0.01 then blended = blended.Unit
+        else blended = novaDir end
+        local curT = novaT / period
+        local pulse = math.sin(curT * math.pi)
+        local r = CFG.radius * (0.15 + pulse * 0.8)
+        local pos = basePos + blended * r
+        if CFG.novaPulse then pos = pos + rVec(CFG.radius * 0.05 * (1 - pulse)) end
+        return pos
+    end
+    local t = novaT / period
+    local pulse = math.sin(t * math.pi)
+    local r = CFG.radius * (0.15 + pulse * 0.8)
+    local pos = basePos + novaDir * r
+    if CFG.novaPulse then pos = pos + rVec(CFG.radius * 0.05 * (1 - pulse)) end
+    return pos
+end
+
+local function methodAnchor(m, dt)
+    if m == "Drift" then
+        local dx, dy, dz = driftDir3D(elapsed)
+        driftDir = driftDir:Lerp(Vector3.new(dx,dy,dz).Unit, CFG.chaos * dt * 10)
+        voidPos = voidPos + driftDir * CFG.speed * dt
+        local off = voidPos - basePos
+        if off.Magnitude > CFG.radius then
+            local n = off.Unit
+            driftDir = driftDir - 2 * driftDir:Dot(n) * n
+            driftDir = (driftDir + rVec(0.3) * 0.5).Unit
+            voidPos = basePos + n * CFG.radius * (0.85 + rng:NextNumber()*0.15)
+        end
+        return voidPos
+    elseif m == "Chaos" then
+        voidPos = voidPos + rVec(CFG.speed * dt * 5)
+        local off = voidPos - basePos
+        if off.Magnitude > CFG.radius then
+            voidPos = basePos + off.Unit * CFG.radius * (0.7 + rng:NextNumber()*0.25)
+        end
+        return voidPos
+    elseif m == "Loop" then
+        local t = elapsed
+        local r = CFG.radius * (0.6 + 0.25*math.sin(t*0.3) + 0.15*math.sin(t*0.73))
+        return basePos + Vector3.new(
+            math.cos(t*2 + math.sin(t*0.1)*3) * r,
+            altJ(math.sin(t*1.3) * r * 0.2),
+            math.sin(t*2 + math.sin(t*0.1)*3) * r
+        )
+    elseif m == "Spiral" then
+        local t = elapsed
+        local r = CFG.radius * (0.5 + 0.4*math.abs(math.sin(t*0.15)*math.cos(t*0.07)))
+        local ph = t*3 + math.sin(t*0.2)*2
+        return basePos + Vector3.new(
+            math.cos(ph)*r, altJ(math.sin(t*0.5)*r*0.3), math.sin(ph)*r
+        )
+    elseif m == "HyperChaos" then
+        local th = rng:NextNumber()*math.pi*2
+        local phi = math.acos(math.clamp(2*rng:NextNumber()-1, -1, 1))
+        local r = CFG.radius * (rng:NextNumber() ^ CFG.skew)
+        return basePos + Vector3.new(
+            r*math.sin(phi)*math.cos(th), altJ(r*math.cos(phi)), r*math.sin(phi)*math.sin(th)
+        )
+    elseif m == "Scatter" then
+        return basePos + Vector3.new(
+            triR()*CFG.radius, altJ(triR()*CFG.alt), triR()*CFG.radius
+        ) + rVec(CFG.mtpSpread)
+    elseif m == "Rift" then
+        local snap = CFG.radius * 0.7
+        local rx = (xorShift()-0.5)*2*CFG.radius
+        local rz = (xorShift()-0.5)*2*CFG.radius
+        if rng:NextNumber() < 0.6 then rx = rx >= 0 and snap or -snap end
+        if rng:NextNumber() < 0.6 then rz = rz >= 0 and snap or -snap end
+        local ry = altJ((xorShift()-0.5)*2*CFG.radius)
+        return basePos + Vector3.new(rx, ry, rz)
+    elseif m == "Storm" then
+        local t = elapsed
+        local x = math.sin(t*7.3)*CFG.radius*0.4 + math.sin(t*13.1)*CFG.radius*0.3 + math.cos(t*3.7)*CFG.radius*0.3
+        local y = altJ(math.cos(t*5.1)*CFG.radius*0.2 + math.sin(t*11.7)*CFG.radius*0.15)
+        local z = math.cos(t*9.9)*CFG.radius*0.4 + math.cos(t*17.3)*CFG.radius*0.3 + math.sin(t*2.9)*CFG.radius*0.3
+        return basePos + Vector3.new(x, y, z) + rVec(CFG.radius*0.1)
+    end
+    return voidPos
+end
+
+local function dwellWobble(amount)
+    return Vector3.new(
+        math.sin(elapsed*3.7 + dwellSeed)*amount,
+        math.sin(elapsed*2.3 + dwellSeed*1.4)*amount*0.5,
+        math.cos(elapsed*4.1 + dwellSeed*0.8)*amount
+    )
+end
+
+local function stepDrift(dt, threats, minD)
+    local m = CFG.method
+    if m == "Quantum" then return quantumStep(threats, minD) + evOffset end
+    if m == "Nova" then return novaStep(dt) + evOffset end
+    if TELEPORT_METHODS[m] and CFG.dwell then
+        local forced = minD < CFG.evRadius * 0.5
+        if forced and (elapsed - dwellStart) < 0.035 then forced = false end
+        local capHit = (elapsed - dwellStart) > CFG.dwellCap
+        if forced or capHit or dwellLeft <= 0 or not dwellAnchor then
+            dwellAnchor = methodAnchor(m, dt)
+            dwellLeft = forced and 1 or rng:NextInteger(CFG.dMin, CFG.dMax)
+            dwellSpread = CFG.radius * CFG.dJitter
+            dwellSeed = rng:NextNumber() * math.pi * 2
+            dwellStart = elapsed
+        end
+        dwellLeft = dwellLeft - 1
+        dwellSpread = math.min(dwellSpread + CFG.radius*0.004*boost(), CFG.radius*CFG.dJitter*2.5)
+        local wobble = dwellWobble(CFG.radius*0.008*boost())
+        return dwellAnchor + wobble + rVec(dwellSpread*0.12) + evOffset
+    end
+    return methodAnchor(m, dt) + evOffset
+end
+
+local function updatePhase(dt)
+    if not CFG.phase then return end
+    phaseT = phaseT + dt
+    if phaseT >= CFG.phaseInt then
+        phaseT = 0
+        local pool
+        local trend = qPressure - qPressurePrev
+        if CFG.phaseAdaptive then
+            if trend > 0.05 or qPressure >= 0.7 then pool = CFG.phaseHigh
+            elseif qPressure < 0.3 then pool = CFG.phaseLow
+            else pool = CFG.phaseMid end
+        else
+            pool = CFG.phaseMethods
+        end
+        phaseIdx = (phaseIdx % #pool) + 1
+        local nm = pool[phaseIdx]
+        if nm ~= CFG.method then
+            if nm == "Quantum" then qState = nil; qThreatSnap = nil; dwellAnchor = nil end
+            if nm == "Nova" then novaT = 0; novaPhase = 0; novaDir = Vector3.new(0,0,1) end
+            CFG.method = nm
+        end
+    end
+end
+
+----------------------------------------------------------------
+-- MIRROR MANIPULATION
+----------------------------------------------------------------
+
+local function mirrorAxisFromThreats(threats)
+    if #threats == 0 then return "X" end
+    local cx, cy, cz = 0, 0, 0
+    for _, t in ipairs(threats) do
+        cx = cx + t.pos.X; cy = cy + t.pos.Y; cz = cz + t.pos.Z
+    end
+    local n = #threats
+    cx, cy, cz = cx/n, cy/n, cz/n
+    local dx, dy, dz = target.X - cx, target.Y - cy, target.Z - cz
+    local ax, ay, az = math.abs(dx), math.abs(dy), math.abs(dz)
+    if ax >= ay and ax >= az then return "X"
+    elseif ay >= az then return "Y"
+    else return "Z" end
+end
+
+local function applyMirror(pos, dir, threats, dt)
+    if not CFG.mirror then return pos, dir end
+
+    local doMirror = false
+    if CFG.mirrorMode == "Always" then
+        doMirror = true
+    elseif CFG.mirrorMode == "Alternate" then
+        mirrorTimer = mirrorTimer + dt
+        if mirrorTimer >= CFG.mirrorRate then
+            mirrorTimer = mirrorTimer - CFG.mirrorRate
+            mirrorOn = not mirrorOn
+        end
+        doMirror = mirrorOn
+    elseif CFG.mirrorMode == "Random" then
+        mirrorTimer = mirrorTimer + dt
+        if mirrorTimer >= CFG.mirrorRate then
+            mirrorTimer = mirrorTimer - CFG.mirrorRate
+            mirrorOn = rng:NextNumber() < 0.5
+        end
+        doMirror = mirrorOn
+    elseif CFG.mirrorMode == "Threat" then
+        doMirror = #threats > 0
+    end
+
+    if not doMirror then return pos, dir end
+
+    local axis = CFG.mirrorAxis
+    if axis == "Random" then
+        axis = ({"X","Y","Z"})[rng:NextInteger(1,3)]
+    elseif axis == "Threat" then
+        axis = mirrorAxisFromThreats(threats)
+    end
+
+    local rel = pos - basePos
+    if axis == "X" then
+        return basePos + Vector3.new(-rel.X, rel.Y, rel.Z), Vector3.new(-dir.X, dir.Y, dir.Z)
+    elseif axis == "Y" then
+        return basePos + Vector3.new(rel.X, -rel.Y, rel.Z), Vector3.new(dir.X, -dir.Y, dir.Z)
+    elseif axis == "Z" then
+        return basePos + Vector3.new(rel.X, rel.Y, -rel.Z), Vector3.new(dir.X, dir.Y, -dir.Z)
+    elseif axis == "All" then
+        return basePos - rel, -dir
+    end
+    return pos, dir
+end
+
+----------------------------------------------------------------
+-- Decoys (burst / ghost / chaff)
+----------------------------------------------------------------
+
+local function burst(hrp, dir)
+    if not CFG.mtp then return end
+    -- Adaptive count: more decoys when threatened
+    local count = CFG.mtpCount + math.floor(qPressure * 6)
+    for i = 1, count do
+        local off
+        if CFG.mtpFib then
+            off = fibSpherePoint(i-1, count, CFG.mtpSpread * (0.5 + rng:NextNumber()*0.5))
+        elseif CFG.mtpStruct and dir and dir.Magnitude > 0.01 then
+            local fwd = dir.Unit
+            local right = fwd:Cross(Vector3.new(0,1,0))
+            if right.Magnitude < 0.01 then right = Vector3.new(1,0,0) end
+            right = right.Unit
+            local up = right:Cross(fwd).Unit
+            local dirs = { fwd, -fwd, right, -right, up, -up,
+                           (fwd+right).Unit, (fwd-right).Unit,
+                           (fwd+up).Unit, (fwd-up).Unit }
+            off = (dirs[i] or fwd) * CFG.mtpSpread * (0.8 + rng:NextNumber()*0.4)
+        else
+            off = rVec(CFG.mtpSpread)
+        end
+        pcall(_setCF, hrp, CFrame.new(target + off))
+    end
+end
+
+-- IMPROVED: adaptive count + real-anchor (pre-mirror) dual ghosting
+local function ghosts(hrp, anchor, dir, pres, realAnchor)
+    if not CFG.ghost then return end
+    local dynSpread = CFG.ghostDynamic and (CFG.ghostSpread * (1 + pres*2)) or CFG.ghostSpread
+    local useTrail = CFG.ghostTrail and dir and dir.Magnitude > 0.01
+    local trailDir = useTrail and dir.Unit or nil
+
+    local baseCount = CFG.ghostCount + math.floor(pres * 5)
+    for i = 1, baseCount do
+        local pos
+        if CFG.ghostRing then
+            local a = (i/baseCount)*math.pi*2 + rng:NextNumber()*0.6
+            local vertJitter = (rng:NextNumber()-0.5)*dynSpread*(0.35 + pres*0.5)
+            pos = anchor + Vector3.new(math.cos(a)*dynSpread, vertJitter, math.sin(a)*dynSpread)
+        elseif useTrail then
+            local t = (i/baseCount)*dynSpread
+            pos = anchor - trailDir*t + xVec(dynSpread*0.3)
+        else
+            pos = anchor + xVec(dynSpread)
+        end
+        pcall(_setCF, hrp, CFrame.new(pos))
+    end
+
+    -- Dual ghost: also frame the unmirrored anchor so both sides are visible
+    if CFG.mirrorDual and CFG.mirror and realAnchor and (realAnchor - anchor).Magnitude > CFG.radius * 0.05 then
+        local extra = math.max(2, math.ceil(baseCount / 2))
+        for i = 1, extra do
+            local pos = realAnchor + xVec(dynSpread * 0.7)
+            pcall(_setCF, hrp, CFrame.new(pos))
+        end
+    end
+end
+
+local function chaff(hrp, dir)
+    if not (CFG.velSpoof or CFG.pulse) then return end
+    local vel = Vector3.new()
+    if CFG.velSpoof then
+        if CFG.chaffMode == "random" then
+            vel = rVec(CFG.velForce)
+        else
+            vel = dir * CFG.velForce * (0.5 + rng:NextNumber()*0.5)
+                  + Vector3.new(0, (rng:NextNumber()-0.5)*CFG.velForce, 0)
+        end
+    end
+    if CFG.pulse then vel = vel + rVec(CFG.pulseForce) end
+    pcall(_setVel, hrp, vel)
+end
+
+----------------------------------------------------------------
+-- Main tick
+----------------------------------------------------------------
+
+local function tick(dt)
+    if evCD > 0 then evCD = evCD - dt end
+    if hum and hum.Health <= 0 then return end
+    updatePhase(dt)
+    decayEv(dt)
+
+    if math.abs(basePos.Y - CFG.alt) > 1 then
+        basePos = Vector3.new(basePos.X, basePos.Y + (CFG.alt - basePos.Y) * math.min(1, dt * 1.5), basePos.Z)
+    end
+
+    local threats, sum, minD, closestPos, closestVel = scan()
+    evade(threats, sum, minD, closestVel)
+    qPressurePrev = qPressure
+    qPressure = pressure(threats, minD)
+
+    local prev = target
+    local realTarget = clampPos(stepDrift(dt, threats, minD))
+
+    -- Track pre-mirror motion for coherence / stuck detection
+    track(realTarget)
+
+    local jump = realTarget - prev
+    if jump.Magnitude > 0.01 then jump = jump.Unit else jump = Vector3.new() end
+
+    -- Apply mirror manipulation (mirror preserves bounds since |offset| preserved)
+    target, jump = applyMirror(realTarget, jump, threats, dt)
+
+    -- Track visited positions (both real and mirrored) for coherence
+    if (realTarget - prev).Magnitude > CFG.radius * 0.03 then
+        lastMoveT = elapsed
+        visitedPos[#visitedPos + 1] = { pos = realTarget, t = elapsed }
+        if target ~= realTarget then
+            visitedPos[#visitedPos + 1] = { pos = target, t = elapsed }
+        end
+        while #visitedPos > 16 do table.remove(visitedPos, 1) end
+        while #visitedPos > 0 and visitedPos[1].t < elapsed - 1.5 do table.remove(visitedPos, 1) end
+    end
+
+    local effSkip = math.max(0.01, CFG.skip * (1 - qPressure * 0.8))
+    frameOK = (rng:NextNumber() >= effSkip) or snapBoost > 0
+
+    local hrp = root
+    if not hrp then return end
+
+    if CFG.snapCheck and lastSet then
+        local thr = CFG.adSnap
+            and math.max(CFG.radius * 0.001, 1e5)
+            or  math.max(CFG.radius * 0.01,  1e6)
+        if (hrp.Position - lastSet).Magnitude > thr then
+            snapBoost = 3
+            if CFG.snapRetarget then
+                qState = nil; qThreatSnap = nil; dwellAnchor = nil; dwellLeft = 0
+            end
+        end
+    end
+
+    if not frameOK then return end
+
+    pcall(_setCF, hrp, makeCF(target, jump))
+    pcall(_setVel, hrp, Vector3.zero)
+    pcall(_setAng, hrp, Vector3.zero)
+    lastSet = target
+
+    heartFrame = heartFrame + 1
+    local doGhost = heartFrame % CFG.ghostRate == 0 or snapBoost > 0
+    local doMtp   = heartFrame % CFG.mtpRate == 0 or snapBoost > 0
+    if doGhost then ghosts(hrp, target, jump, qPressure, realTarget) end
+    if doMtp then
+        burst(hrp, jump)
+        if rng:NextNumber() < 0.25 then burst(hrp, jump) end
+    end
+    chaff(hrp, jump)
+    if snapBoost > 0 then snapBoost = snapBoost - 1 end
+end
+
+function startVoid()
+    kill("void"); kill("voidRender")
+    if root then voidPos = Vector3.new(root.Position.X, CFG.alt, root.Position.Z)
+    else voidPos = Vector3.new(0, CFG.alt, 0) end
+    basePos = Vector3.new(0, CFG.alt, 0)
+    target = voidPos
+    elapsed, phaseT, phaseIdx = 0, 0, 1
+    evOffset = Vector3.new()
+    qState, qHold, qAge, qSpread = nil, 1, 0, 0
+    qPressure, qPressureAtPick, qPressurePrev = 0, 0, 0
+    qThreatSnap = nil
+    dwellAnchor, dwellLeft, dwellSpread, dwellSeed, dwellStart = nil, 0, 0, 0, 0
+    motionHist, motionN, motionVar = {}, 0, 1
+    visitedPos = {}
+    lastMoveT = 0; lastSet, heartFrame, snapBoost = nil, 0, 0; frameOK = true
+    novaT, novaPhase = 0, 0
+    novaDir = Vector3.new(0,0,1); novaDirFrom = novaDir; novaSmoothT = 1
+    avgDt = 1/60
+    mirrorOn, mirrorTimer = false, 0
+
+    local errCount = 0
+    conns.void = RunService.Heartbeat:Connect(function(dt)
+        if not CFG.enabled then kill("void"); return end
+        dt = math.min(dt, 0.1)
+        avgDt = avgDt * 0.92 + dt * 0.08
+        elapsed = elapsed + dt
+        local ok, err = pcall(tick, dt)
+        if not ok then
+            errCount = errCount + 1
+            if errCount == 10 then warn("[DeepSeek.Lua] void tick errors: " .. tostring(err)) end
+        end
+    end)
+
+    if CFG.subTick then
+        conns.voidRender = RunService.RenderStepped:Connect(function()
+            if not CFG.enabled then kill("voidRender"); return end
+            if not frameOK then return end
+            local hrp = root
+            if not hrp then return end
+            pcall(_setCF, hrp, makeCF(target, nil))
+            pcall(_setVel, hrp, Vector3.zero)
+            pcall(_setAng, hrp, Vector3.zero)
+            ghosts(hrp, target, nil, qPressure, nil)
+        end)
+    end
+end
+
+function stopVoid() kill("void"); kill("voidRender") end
+
+-- orbit
+local orb = { enabled=false, speed=90, dist=8, height=0, lerp=0.3,
+    mode="Circle", predict=false, predStrength=0.2, face=true, autoLock=50 }
+local orbAngle, orbElapsed, orbRadius = 0, 0, 0
+
+function startOrbit()
+    kill("orbit")
+    if hum and hum.Parent and hum.Health > 0 then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+    end
+    orbAngle, orbElapsed, orbRadius = 0, 0, orb.dist
+    conns.orbit = RunService.Heartbeat:Connect(function(dt)
+        if not orb.enabled or not root then
+            if not orb.enabled then kill("orbit") end
+            return
+        end
+        local tgt = closest()
+        if not tgt or not tgt.Character then return end
+        local hrp = tgt.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        if (root.Position - hrp.Position).Magnitude > orb.autoLock then return end
+        local tp = hrp.Position
+        if orb.predict then tp = tp + hrp.AssemblyLinearVelocity * orb.predStrength end
+        orbAngle = orbAngle + math.rad(orb.speed) * dt
+        orbElapsed = orbElapsed + dt
+        local r, h = orb.dist, orb.height
+        local x, y, z = 0, 0, 0
+        if orb.mode == "Circle" then x=math.cos(orbAngle)*r; z=math.sin(orbAngle)*r; y=h
+        elseif orb.mode == "Figure 8" then x=math.sin(orbAngle)*r; z=math.sin(orbAngle)*math.cos(orbAngle)*r*0.7; y=h
+        elseif orb.mode == "Spiral In" then orbRadius=math.max(1, orbRadius-dt*2); x=math.cos(orbAngle)*orbRadius; z=math.sin(orbAngle)*orbRadius; y=h
+        elseif orb.mode == "Spiral Out" then orbRadius=math.min(orb.dist*2, orbRadius+dt*2); x=math.cos(orbAngle)*orbRadius; z=math.sin(orbAngle)*orbRadius; y=h
+        elseif orb.mode == "Bounce" then x=math.cos(orbAngle)*r; z=math.sin(orbAngle)*r; y=h+math.sin(orbElapsed*3)*5 end
+        local dst = tp + Vector3.new(x,y,z)
+        local smooth = root.Position:Lerp(dst, orb.lerp)
+        if orb.face then root.CFrame = CFrame.new(smooth, Vector3.new(tp.X, smooth.Y, tp.Z))
+        else root.CFrame = CFrame.new(smooth) end
+    end)
+end
+function stopOrbit()
+    kill("orbit"); orb.enabled = false
+    if not (hum and hum.Parent and hum.Health > 0) then return end
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+    task.delay(0.1, function()
+        if not (hum and hum.Parent and hum.Health > 0) then return end
+        pcall(function()
+            if hum:GetState() == Enum.HumanoidStateType.Physics then
+                hum:ChangeState(Enum.HumanoidStateType.Freefall)
+            end
+        end)
+    end)
+end
+
+-- antiaim
+local aa = { enabled=false, mode="Spin", speed=5000, angle=90, randSpeed=true, jitterPitch=true }
+local aaAngle, aaState, aaRT, aaRM = 0, 0, 0, 1
+function startAntiAim()
+    kill("antiAim")
+    conns.antiAim = RunService.Heartbeat:Connect(function(dt)
+        if not aa.enabled or not root then
+            if not aa.enabled then kill("antiAim") end
+            return
+        end
+        local s = aa.speed
+        if aa.randSpeed then
+            aaRT = aaRT + dt
+            if aaRT > 0.1 then aaRT = 0; aaRM = 0.2 + math.random()*0.8 end
+            s = s * aaRM
+        end
+        if aa.mode == "Spin" then
+            aaAngle = aaAngle + s*dt
+            root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(aaAngle), 0)
+        elseif aa.mode == "Jitter" then
+            root.CFrame = root.CFrame * CFrame.Angles(
+                math.rad(aaState == 0 and aa.angle or -aa.angle),
+                math.rad(aaState == 0 and aa.angle or -aa.angle), 0)
+            aaState = (aaState + 1) % 2
+        elseif aa.mode == "Static" then
+            root.CFrame = root.CFrame * CFrame.Angles(0, math.rad(aa.angle), 0)
+        end
+    end)
+end
+function stopAntiAim() kill("antiAim"); aa.enabled = false end
+
+-- riot
+local riot = { enabled=false, speed=0.03, range=50, evadeRange=30, spinSpeed=180 }
+local riotT, riotAngle = 0, 0
+function startRiot()
+    kill("riot")
+    conns.riot = RunService.Heartbeat:Connect(function(dt)
+        if not riot.enabled or not root then kill("riot"); return end
+        riotT = riotT + dt
+        if riotT < riot.speed then return end
+        riotT = 0
+        local cur = root.Position
+        local tgt = closest()
+        local newPos = cur
+        if tgt and tgt.Character then
+            local hrp = tgt.Character:FindFirstChild("HumanoidRootPart")
+            if hrp and (cur - hrp.Position).Magnitude < riot.evadeRange then
+                newPos = cur + (cur - hrp.Position).Unit * math.random(riot.range*0.5, riot.range*1.5)
+            else
+                local a = math.random() * 2 * math.pi
+                newPos = cur + Vector3.new(
+                    math.cos(a)*math.random(riot.range*0.2, riot.range),
+                    math.random(-riot.range*0.5, riot.range*0.5),
+                    math.sin(a)*math.random(riot.range*0.2, riot.range))
+            end
+        else
+            local a = math.random() * 2 * math.pi
+            newPos = cur + Vector3.new(
+                math.cos(a)*math.random(riot.range*0.2, riot.range),
+                math.random(-riot.range*0.5, riot.range*0.5),
+                math.sin(a)*math.random(riot.range*0.2, riot.range))
+        end
+        riotAngle = (riotAngle + riot.spinSpeed*dt) % 360
+        pcall(function()
+            root.CFrame = CFrame.new(newPos) * CFrame.Angles(0, math.rad(riotAngle), 0)
+            root.AssemblyLinearVelocity = Vector3.zero
+        end)
+    end)
+end
+function stopRiot() kill("riot"); riot.enabled = false end
+
+-- riot abuse
+local abuse = { enabled=false, height=3, forward=0, right=0, down=0, mode="Stick" }
+function startAbuse()
+    kill("riotAbuse")
+    conns.riotAbuse = RunService.Heartbeat:Connect(function()
+        if not abuse.enabled or not root then
+            if not abuse.enabled then kill("riotAbuse") end
+            return
+        end
+        local tgt = closest()
+        if not tgt or not tgt.Character then return end
+        local tr = tgt.Character:FindFirstChild("HumanoidRootPart")
+        if not tr then return end
+        local off = Vector3.new(abuse.right, abuse.height - abuse.down, abuse.forward)
+        if abuse.mode == "Stick" then
+            root.CFrame = CFrame.new(tr.Position + off)
+        elseif abuse.mode == "Bounce" then
+            local b = math.abs(math.sin(tick() * 8)) * math.abs(abuse.height)
+            root.CFrame = CFrame.new(tr.Position + Vector3.new(abuse.right, b - abuse.down, abuse.forward))
+        end
+        root.AssemblyLinearVelocity = Vector3.zero
+    end)
+end
+function stopAbuse() kill("riotAbuse"); abuse.enabled = false end
+
+-- bind
+local function bind(c)
+    char = c
+    root = c:WaitForChild("HumanoidRootPart", 5)
+    hum  = c:WaitForChild("Humanoid", 5)
+    if riot.enabled then startRiot() end
+    if abuse.enabled then startAbuse() end
+end
+if LocalPlayer.Character then bind(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(function(c)
+    bind(c)
+    task.wait(0.3)
+    if CFG.enabled then startVoid() end
+    if orb.enabled then startOrbit() end
+    if aa.enabled then startAntiAim() end
+end)
+LocalPlayer.CharacterRemoving:Connect(function()
+    for _, k in ipairs({"void","voidRender","orbit","antiAim","riot","riotAbuse"}) do kill(k) end
+    root, hum, char = nil, nil, nil
+end)
+
+-- UI
+local function bindToggle(group, flag, text, default, cb)
+    local t = group:AddToggle(flag, { Text = text, Default = default or false, Callback = cb })
+    t:AddKeyPicker(flag.."Key", { Default = "None", Mode = "Toggle", Text = text, SyncToggleState = true, NoUI = false })
+    return t
+end
+
+local Tabs = {
+    VoidSpam = Window:AddTab("VoidSpam"),
+    Orbit    = Window:AddTab("Orbit"),
+    AntiAim  = Window:AddTab("AntiAim"),
+    Riot     = Window:AddTab("Riot"),
+    Settings = Window:AddTab("Settings"),
+}
+
+local VG = Tabs.VoidSpam:AddLeftGroupbox("Void")
+bindToggle(VG, "VoidToggle", "Enable Void", false, function(v)
+    CFG.enabled = v
+    if v then startVoid() else stopVoid() end
+end)
+VG:AddDropdown("VoidMethod", {
+    Text = "Method", Default = "Quantum",
+    Values = {"Drift","Chaos","Loop","Spiral","Quantum","HyperChaos","Scatter","Rift","Storm","Nova"},
+    Callback = function(v)
+        CFG.method = v; CFG.phase = false; qState = nil; qThreatSnap = nil
+        if v == "Nova" then novaT = 0; novaPhase = 0; novaDir = Vector3.new(0,0,1) end
+        if Toggles.PhaseShift then Toggles.PhaseShift:SetValue(false) end
+    end
+})
+VG:AddSlider("Speed", { Text = "Speed (B/s)", Default = 1, Min = 1, Max = 2000, Rounding = 0, Callback = function(v) CFG.speed = v * 1e9 end })
+VG:AddSlider("Chaos", { Text = "Chaos (%)", Default = 98, Min = 1, Max = 100, Rounding = 0, Callback = function(v) CFG.chaos = v * 0.01 end })
+VG:AddSlider("BaseAltitude", { Text = "Base Altitude (B)", Default = 10, Min = 1, Max = 1000, Rounding = 0, Callback = function(v) CFG.alt = v * 1e9 end })
+VG:AddSlider("Radius", { Text = "Radius (B)", Default = 200, Min = 1, Max = 2000, Rounding = 0, Callback = function(v) CFG.radius = v * 1e9 end })
+
+local VGN = Tabs.VoidSpam:AddLeftGroupbox("Nova")
+VGN:AddSlider("NovaRadius", { Text = "Nova Radius (B)", Default = 300, Min = 50, Max = 3000, Rounding = 0, Callback = function(v) CFG.novaRadius = v * 1e9 end })
+VGN:AddSlider("NovaPhases", { Text = "Phases", Default = 6, Min = 2, Max = 16, Rounding = 0, Callback = function(v) CFG.novaPhases = v end })
+VGN:AddSlider("NovaPeriod", { Text = "Cycle Period (sec)", Default = 0.8, Min = 0.2, Max = 3, Rounding = 2, Callback = function(v) CFG.novaPeriod = v end })
+bindToggle(VGN, "NovaPulse", "Nova Pulse Jitter", true, function(v) CFG.novaPulse = v end)
+
+local VG4 = Tabs.VoidSpam:AddLeftGroupbox("Coherence")
+bindToggle(VG4, "DwellEnabled", "Dwell", true, function(v) CFG.dwell = v end)
+VG4:AddSlider("DwellMin", { Text = "Dwell Min", Default = 2, Min = 1, Max = 20, Rounding = 0, Callback = function(v) CFG.dMin = v end })
+VG4:AddSlider("DwellMax", { Text = "Dwell Max", Default = 8, Min = 1, Max = 30, Rounding = 0, Callback = function(v) CFG.dMax = v end })
+VG4:AddSlider("DwellCap", { Text = "Dwell Cap (sec)", Default = 0.35, Min = 0.05, Max = 2, Rounding = 2, Callback = function(v) CFG.dwellCap = v end })
+VG4:AddSlider("DwellJitter", { Text = "Jitter (% R)", Default = 2, Min = 0, Max = 50, Rounding = 0, Callback = function(v) CFG.dJitter = v * 0.01 end })
+VG4:AddSlider("SkipRate", { Text = "Skip (%)", Default = 8, Min = 0, Max = 40, Rounding = 0, Callback = function(v) CFG.skip = v * 0.01 end })
+VG4:AddSlider("RadiusSkew", { Text = "Radius Skew", Default = 1.5, Min = 1, Max = 4, Rounding = 2, Callback = function(v) CFG.skew = v end })
+VG4:AddSlider("VelFollow", { Text = "Velocity Follow (%)", Default = 40, Min = 0, Max = 100, Rounding = 0, Callback = function(v) CFG.velFollow = v * 0.01 end })
+VG4:AddSlider("StuckThresh", { Text = "Stuck Threshold (sec)", Default = 0.6, Min = 0.1, Max = 3, Rounding = 2, Callback = function(v) CFG.stuckThreshold = v end })
+bindToggle(VG4, "AdaptiveSnap", "Adaptive Snap", true, function(v) CFG.adSnap = v end)
+bindToggle(VG4, "SnapRetarget", "Snap Forces Retarget", true, function(v) CFG.snapRetarget = v end)
+bindToggle(VG4, "PredictivePressure", "Predictive Pressure", true, function(v) CFG.predPressure = v end)
+
+-- Mirror groupbox (NEW)
+local VGM = Tabs.VoidSpam:AddLeftGroupbox("Mirror Manipulation")
+bindToggle(VGM, "MirrorEnabled", "Enable Mirror", false, function(v) CFG.mirror = v; mirrorOn = false; mirrorTimer = 0 end)
+VGM:AddDropdown("MirrorAxis", {
+    Text = "Axis", Default = "X",
+    Values = {"X","Y","Z","All","Random","Threat"},
+    Callback = function(v) CFG.mirrorAxis = v end
+})
+VGM:AddDropdown("MirrorMode", {
+    Text = "Mode", Default = "Alternate",
+    Values = {"Alternate","Always","Random","Threat"},
+    Callback = function(v) CFG.mirrorMode = v end
+})
+VGM:AddSlider("MirrorRate", { Text = "Flip Interval (x0.01s)", Default = 8, Min = 1, Max = 100, Rounding = 0, Callback = function(v) CFG.mirrorRate = v * 0.01 end })
+bindToggle(VGM, "MirrorDual", "Dual Ghost (both sides)", true, function(v) CFG.mirrorDual = v end)
+
+local VG2 = Tabs.VoidSpam:AddRightGroupbox("Evasion")
+bindToggle(VG2, "EvadeEnemies", "Evade", true, function(v) CFG.evade = v end)
+bindToggle(VG2, "SmartEvade", "Perpendicular Escape", true, function(v) CFG.smart = v end)
+bindToggle(VG2, "EvadeCurve", "Gap Finding", true, function(v) CFG.curve = v end)
+bindToggle(VG2, "Evade3D", "3D Gap Finding", true, function(v) CFG.ev3D = v end)
+bindToggle(VG2, "EvadeBoundary", "Boundary-Aware Escape", true, function(v) CFG.evBoundary = v end)
+bindToggle(VG2, "Anticipate", "Anticipate", true, function(v) CFG.anticipate = v end)
+VG2:AddSlider("EvadeRadius", { Text = "Evade Radius (B)", Default = 8, Min = 1, Max = 500, Rounding = 0, Callback = function(v) CFG.evRadius = v * 1e9 end })
+VG2:AddSlider("EvadeSpeed", { Text = "Evade Speed (B/s)", Default = 6, Min = 1, Max = 500, Rounding = 0, Callback = function(v) CFG.evSpeed = v * 1e9 end })
+VG2:AddSlider("EvadeVertical", { Text = "Vertical (B)", Default = 3, Min = 1, Max = 500, Rounding = 0, Callback = function(v) CFG.evVert = v * 1e9 end })
+VG2:AddSlider("EvadeCooldown", { Text = "CD (x0.01s)", Default = 2, Min = 1, Max = 100, Rounding = 0, Callback = function(v) CFG.evCD = v * 0.01 end })
+VG2:AddSlider("EvadeTrigger", { Text = "Trigger (%)", Default = 100, Min = 10, Max = 200, Rounding = 0, Callback = function(v) CFG.evTrigger = v * 0.01 end })
+VG2:AddSlider("EvadeStrength", { Text = "Strength (%)", Default = 100, Min = 10, Max = 300, Rounding = 0, Callback = function(v) CFG.evStrength = v * 0.01 end })
+VG2:AddSlider("EvadeDecay", { Text = "Decay (/s)", Default = 5, Min = 1, Max = 20, Rounding = 0, Callback = function(v) CFG.evDecay = v end })
+VG2:AddSlider("EvadeMaxOff", { Text = "Max Offset (% R)", Default = 50, Min = 10, Max = 100, Rounding = 0, Callback = function(v) CFG.evMax = v * 0.01 end })
+VG2:AddSlider("ThreatLead", { Text = "Threat Lead (ms)", Default = 200, Min = 0, Max = 1000, Rounding = 0, Callback = function(v) CFG.lead = v / 1000 end })
+
+local VGQ = Tabs.VoidSpam:AddRightGroupbox("Quantum")
+VGQ:AddSlider("QLookAhead", { Text = "Look-Ahead Steps", Default = 3, Min = 1, Max = 10, Rounding = 0, Callback = function(v) CFG.qLookAhead = v end })
+VGQ:AddSlider("QSamples", { Text = "Candidate Samples", Default = 24, Min = 8, Max = 64, Rounding = 0, Callback = function(v) CFG.qSamples = v end })
+VGQ:AddSlider("HorizonWeight", { Text = "Horizon Weight (%)", Default = 40, Min = 0, Max = 100, Rounding = 0, Callback = function(v) CFG.horizonWeight = v * 0.01 end })
+VGQ:AddSlider("QPosThresh", { Text = "Retarget Threshold (% R)", Default = 15, Min = 5, Max = 50, Rounding = 0, Callback = function(v) CFG.qPosThresh = v * 0.01 end })
+
+local VG3 = Tabs.VoidSpam:AddRightGroupbox("Advanced")
+bindToggle(VG3, "SubTick", "SubTick", true, function(v) CFG.subTick = v end)
+bindToggle(VG3, "MultiTP", "Multi-TP", true, function(v) CFG.mtp = v end)
+VG3:AddSlider("MultiTPCount", { Text = "Burst Count", Default = 8, Min = 1, Max = 24, Rounding = 0, Callback = function(v) CFG.mtpCount = v end })
+VG3:AddSlider("MultiTPSpread", { Text = "Burst Spread (B)", Default = 5, Min = 1, Max = 100, Rounding = 0, Callback = function(v) CFG.mtpSpread = v * 1e10 end })
+VG3:AddSlider("MultiTPRate", { Text = "Burst Rate", Default = 1, Min = 1, Max = 10, Rounding = 0, Callback = function(v) CFG.mtpRate = v end })
+bindToggle(VG3, "MultiTPFib", "Fibonacci Spread", true, function(v) CFG.mtpFib = v end)
+bindToggle(VG3, "MultiTPStructured", "Structured (if !Fib)", false, function(v) CFG.mtpStruct = v end)
+bindToggle(VG3, "GhostLayer", "Ghosts", true, function(v) CFG.ghost = v end)
+VG3:AddSlider("GhostCount", { Text = "Ghost Count", Default = 3, Min = 1, Max = 10, Rounding = 0, Callback = function(v) CFG.ghostCount = v end })
+VG3:AddSlider("GhostSpread", { Text = "Ghost Spread (B)", Default = 2, Min = 1, Max = 50, Rounding = 0, Callback = function(v) CFG.ghostSpread = v * 1e10 end })
+VG3:AddSlider("GhostRate", { Text = "Ghost Rate", Default = 1, Min = 1, Max = 10, Rounding = 0, Callback = function(v) CFG.ghostRate = v end })
+bindToggle(VG3, "GhostRing", "Ring", true, function(v) CFG.ghostRing = v end)
+bindToggle(VG3, "GhostTrail", "Trail", true, function(v) CFG.ghostTrail = v end)
+bindToggle(VG3, "GhostDynamic", "Dynamic Spread", true, function(v) CFG.ghostDynamic = v end)
+bindToggle(VG3, "VelSpoof", "Velocity Spoof", true, function(v) CFG.velSpoof = v end)
+VG3:AddDropdown("ChaffMode", { Text = "Chaff Mode", Default = "random", Values = {"random", "aligned"}, Callback = function(v) CFG.chaffMode = v end })
+VG3:AddSlider("VelSpoofForce", { Text = "Spoof Force (M)", Default = 500, Min = 1, Max = 2000, Rounding = 0, Callback = function(v) CFG.velForce = v * 1e6 end })
+bindToggle(VG3, "PulseToggle", "Anti-Freeze Pulse", true, function(v) CFG.pulse = v end)
+VG3:AddSlider("PulseForce", { Text = "Pulse Force (M)", Default = 80, Min = 1, Max = 500, Rounding = 0, Callback = function(v) CFG.pulseForce = v * 1e6 end })
+bindToggle(VG3, "AltChaos", "Alt Chaos", true, function(v) CFG.altChaos = v end)
+VG3:AddSlider("AltRange", { Text = "Alt Range (B)", Default = 5, Min = 1, Max = 200, Rounding = 0, Callback = function(v) CFG.altRange = v * 1e10 end })
+bindToggle(VG3, "PhaseShift", "Phase Shift", true, function(v) CFG.phase = v end)
+bindToggle(VG3, "PhaseAdaptive", "Adaptive Phase", true, function(v) CFG.phaseAdaptive = v end)
+VG3:AddSlider("PhaseInterval", { Text = "Shift (ms)", Default = 60, Min = 20, Max = 500, Rounding = 0, Callback = function(v) CFG.phaseInt = v / 1000 end })
+bindToggle(VG3, "MotionBoost", "Motion Boost", true, function(v) CFG.motionBoost = v end)
+bindToggle(VG3, "RandomOrient", "Random Orient", true, function(v) CFG.randOrient = v end)
+bindToggle(VG3, "SnapCorrect", "Snap Detection", true, function(v) CFG.snapCheck = v end)
+
+-- Orbit
+local OG = Tabs.Orbit:AddLeftGroupbox("Orbit")
+bindToggle(OG, "OrbitToggle", "Enable", false, function(v) orb.enabled = v; if v then startOrbit() else stopOrbit() end end)
+OG:AddDropdown("OrbitMode", { Text = "Mode", Default = "Circle", Values = {"Circle","Figure 8","Spiral In","Spiral Out","Bounce"}, Callback = function(v) orb.mode = v; orbRadius = orb.dist end })
+OG:AddSlider("OrbitSpeed", { Text = "Speed (deg/s)", Default = 90, Min = 5, Max = 720, Rounding = 0, Callback = function(v) orb.speed = v end })
+OG:AddSlider("OrbitDist", { Text = "Radius", Default = 8, Min = 1, Max = 200, Rounding = 0, Callback = function(v) orb.dist = v; orbRadius = v end })
+OG:AddSlider("OrbitHeight", { Text = "Height", Default = 0, Min = -200, Max = 200, Rounding = 0, Callback = function(v) orb.height = v end })
+OG:AddSlider("OrbitLerp", { Text = "Smoothing", Default = 30, Min = 1, Max = 100, Rounding = 0, Callback = function(v) orb.lerp = v / 100 end })
+local OG2 = Tabs.Orbit:AddRightGroupbox("Advanced")
+bindToggle(OG2, "OrbitFaceTarget", "Face Target", true, function(v) orb.face = v end)
+bindToggle(OG2, "OrbitPredict", "Predict", false, function(v) orb.predict = v end)
+OG2:AddSlider("OrbitPredStrength", { Text = "Pred Strength", Default = 20, Min = 0, Max = 100, Rounding = 0, Suffix = "%", Callback = function(v) orb.predStrength = v / 100 end })
+OG2:AddSlider("OrbitAutoLockDist", { Text = "Auto-Lock Dist", Default = 50, Min = 10, Max = 500, Rounding = 0, Callback = function(v) orb.autoLock = v end })
+
+-- AntiAim
+local AG = Tabs.AntiAim:AddLeftGroupbox("Anti-Aim")
+bindToggle(AG, "AaToggle", "Enable", false, function(v) aa.enabled = v; if v then startAntiAim() else stopAntiAim() end end)
+AG:AddDropdown("AaMode", { Text = "Mode", Default = "Spin", Values = {"Spin","Jitter","Static"}, Callback = function(v) aa.mode = v end })
+AG:AddSlider("AaSpeed", { Text = "Speed (deg/s)", Default = 5000, Min = 100, Max = 5000, Rounding = 0, Callback = function(v) aa.speed = v end })
+AG:AddSlider("AaAngle", { Text = "Jitter/Static Angle", Default = 90, Min = 10, Max = 180, Rounding = 0, Callback = function(v) aa.angle = v end })
+bindToggle(AG, "AaRandomSpeed", "Rand Speed", true, function(v) aa.randSpeed = v end)
+bindToggle(AG, "AaJitterPitch", "Pitch Jitter", true, function(v) aa.jitterPitch = v end)
+
+-- Riot
+local GG = Tabs.Riot:AddLeftGroupbox("Riot")
+bindToggle(GG, "RiotToggle", "Enable", false, function(v) riot.enabled = v; if v then startRiot() else stopRiot() end end)
+GG:AddSlider("RiotSpeed", { Text = "TP Delay (sec)", Default = 0.03, Min = 0.01, Max = 0.5, Rounding = 2, Callback = function(v) riot.speed = v end })
+GG:AddSlider("RiotRange", { Text = "Jump Range", Default = 50, Min = 10, Max = 200, Rounding = 0, Callback = function(v) riot.range = v end })
+GG:AddSlider("RiotEvadeRange", { Text = "Evade Range", Default = 30, Min = 0, Max = 100, Rounding = 0, Callback = function(v) riot.evadeRange = v end })
+GG:AddSlider("RiotSpinSpeed", { Text = "Spin Speed", Default = 180, Min = 0, Max = 720, Rounding = 0, Callback = function(v) riot.spinSpeed = v end })
+
+local RA = Tabs.Riot:AddLeftGroupbox("Riot Abuse")
+bindToggle(RA, "RiotAbuseToggle", "Enable", false, function(v)
+    abuse.enabled = v
+    if v then startAbuse(); Notify("Abuse on", 2) else stopAbuse(); Notify("Abuse off", 2) end
+end)
+RA:AddDropdown("RiotAbuseMode", { Text = "Mode", Default = "Stick", Values = {"Stick","Bounce"}, Callback = function(v) abuse.mode = v end })
+RA:AddSlider("RiotAbuseHeight", { Text = "Height", Default = 3, Min = -50, Max = 50, Rounding = 1, Suffix = "m", Callback = function(v) abuse.height = v end })
+RA:AddSlider("RiotAbuseForward", { Text = "Forward", Default = 0, Min = -50, Max = 50, Rounding = 1, Suffix = "m", Callback = function(v) abuse.forward = v end })
+RA:AddSlider("RiotAbuseRight", { Text = "Right", Default = 0, Min = -50, Max = 50, Rounding = 1, Suffix = "m", Callback = function(v) abuse.right = v end })
+RA:AddSlider("RiotAbuseDown", { Text = "Down", Default = 0, Min = 0, Max = 50, Rounding = 1, Suffix = "m", Callback = function(v) abuse.down = v end })
+
+-- Settings
+local Menu = Tabs.Settings:AddLeftGroupbox("Menu")
+Menu:AddToggle("KeybindMenu", { Text = "Keybind Menu", Default = false, Callback = function(v)
+    pcall(function() if Library.KeybindFrame then Library.KeybindFrame.Visible = v end end)
+end })
+local UI = Tabs.Settings:AddLeftGroupbox("UI")
+UI:AddLabel("Menu Keybind"):AddKeyPicker("MenuKeybind", { Default = "RightShift", Text = "Menu Keybind", Mode = "Toggle", NoUI = false })
+Library.ToggleKeybind = Options.MenuKeybind
+local autoLoad = true
+UI:AddToggle("AutoLoad", { Text = "Auto Load Config", Default = true, Callback = function(v) autoLoad = v end })
+UI:AddButton("Unload", function()
+    for _, k in ipairs({"void","voidRender","orbit","antiAim","riot","riotAbuse"}) do kill(k) end
+    Library:Unload()
+end)
+
+local ThemeManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/ThemeManager.lua"))()
+local SaveManager  = loadstring(game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/main/addons/SaveManager.lua"))()
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({"MenuKeybind"})
+ThemeManager:SetFolder("DeepSeekLua")
+SaveManager:SetFolder("DeepSeekLua/configs")
+SaveManager:BuildConfigSection(Tabs.Settings)
+ThemeManager:ApplyToTab(Tabs.Settings)
+
+if autoLoad then pcall(function() SaveManager:LoadAutoloadConfig() end) end
+
+Library:Notify({ Title = "DeepSeek.Lua", Description = "v4.5 loaded — Mirror Manipulation added", Time = 4 })
